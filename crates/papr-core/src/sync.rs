@@ -10,7 +10,10 @@
 //! new server feeds) and push any local-only feeds back to the server (so the
 //! two subscription lists converge rather than drifting), then pull the recent
 //! reading-list (to reconcile read/starred state, matched to local articles by
-//! URL).
+//! URL). Changes queued before their article had a `remote_id` are pushed in a
+//! second pass right after the pull assigns one — a single pass would either
+//! skip them (they never reach the server) or the pull's state write would
+//! clobber them (they silently vanish locally).
 //!
 //! # Provider differences
 //!
@@ -36,6 +39,7 @@ use chrono::{TimeZone, Utc};
 use reqwest::{Client, RequestBuilder};
 use rusqlite::Connection;
 use serde::de::DeserializeOwned;
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use tokio::sync::Mutex;
@@ -274,8 +278,36 @@ struct IdList {
     item_refs: Vec<ItemRef>,
     /// Miniflux's continuation is a numeric *offset*, unlike FreshRSS's
     /// opaque token. `0` / absent means the end of the stream.
-    #[serde(default)]
-    continuation: usize,
+    ///
+    /// Miniflux serialises this field as a JSON *string* (Go's `,string`
+    /// tag — `"1000"`), not a number, so a plain `usize` field fails to
+    /// decode and kills the whole pull; see `de_continuation`.
+    #[serde(default, deserialize_with = "de_continuation")]
+    continuation: Option<usize>,
+}
+
+/// Deserialise Miniflux's continuation offset: a JSON string (`"1000"`),
+/// a plain number (`1000`), `null`, or a missing field (end of stream).
+fn de_continuation<'de, D>(de: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(de)?;
+    match v {
+        serde_json::Value::Number(n) => n
+            .as_u64()
+            .map(|n| Some(n as usize))
+            .ok_or_else(|| D::Error::custom("continuation must be a non-negative integer")),
+        serde_json::Value::String(s) if s.is_empty() => Ok(None),
+        serde_json::Value::String(s) => s
+            .parse()
+            .map(Some)
+            .map_err(|_| D::Error::custom("continuation is not a number")),
+        serde_json::Value::Null => Ok(None),
+        other => Err(D::Error::custom(format!(
+            "continuation: unexpected value {other}"
+        ))),
+    }
 }
 #[derive(Deserialize)]
 struct ItemRef {
@@ -296,12 +328,23 @@ struct Item {
     content: Option<ItemContent>,
     #[serde(default)]
     origin: Option<ItemOrigin>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_vec")]
     categories: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_vec")]
     canonical: Vec<Href>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_vec")]
     alternate: Vec<Href>,
+}
+
+/// Deserialise a `Vec` that may arrive as JSON `null` (Go servers marshal
+/// nil slices that way). Missing fields fall back to `#[serde(default)]`'s
+/// empty vec; `null` becomes an empty vec instead of a decode error.
+fn de_vec<'de, D, T>(de: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: DeserializeOwned,
+{
+    Ok(Option::<Vec<T>>::deserialize(de)?.unwrap_or_default())
 }
 #[derive(Deserialize)]
 struct ItemContent {
@@ -1001,13 +1044,14 @@ async fn fetch_item_ids(
         for item in page.item_refs {
             out.push(item.id);
         }
-        // Miniflux's continuation is the next offset (an integer), and a
-        // zero / absent continuation means we've reached the end.
-        let cont = page.continuation;
-        if cont == 0 || out.is_empty() {
-            break;
+        // Miniflux's continuation is the next offset (an integer, and a JSON
+        // *string* on the wire); a zero / absent continuation means we've
+        // reached the end of the stream. Guard against an offset that never
+        // advances (a misbehaving server would otherwise loop to MAX_PAGES).
+        match page.continuation {
+            Some(c) if c > offset.unwrap_or(0) => offset = Some(c),
+            _ => break,
         }
-        offset = Some(cont);
     }
     Ok(out)
 }
@@ -1308,15 +1352,34 @@ pub async fn sync_now(db: &Db, http: &Client) -> AppResult<usize> {
                 }
             };
 
+            // The remote id is persisted even when the article has a pending
+            // local change, so the push pass right after this pull can send it.
             db::set_remote_id(&conn, aid, &item.id)?;
+            // A still-queued local change (e.g. queued before this article had
+            // a remote id) must not be overwritten by server state, nor
+            // cleared — it is pushed in step 3b below. Overwriting it here
+            // would silently drop the user's star/read edit (the "two-way
+            // alignment" bug): locally the change looks applied, but it never
+            // reaches the server.
+            if db::article_has_pending_sync(&conn, aid)? {
+                log::debug!(
+                    "sync: deferring server state for article {aid} (pending local change)"
+                );
+                continue;
+            }
             db::set_sync_state(&conn, aid, read, starred)?;
             db::clear_sync_queue_for_article(&conn, aid)?;
             reconciled += 1;
         }
     }
 
+    // 3b ── second push pass: changes queued before the pull had no remote id
+    // and were left in the queue; the pull above just assigned one, so push
+    // them now and reach the server in the same sync run.
+    let pushed_after_pull = push_queue(db, http, &session, "after pull").await?;
+
     log::info!(
-        "sync: finished; reconciled_articles={reconciled}; inserted_articles={inserted}; pushed_before_pull={pushed_count}"
+        "sync: finished; reconciled_articles={reconciled}; inserted_articles={inserted}; pushed_before_pull={pushed_count}; pushed_after_pull={pushed_after_pull}"
     );
     // The count callers surface ("aligned the state of N articles", the CLI's
     // `reconciled` field) is the number of articles the server state was
@@ -1471,5 +1534,36 @@ mod tests {
         assert_eq!(a.content_html.as_deref(), Some("<p>Body</p>"));
         assert!(a.body_text.contains("Body"));
         assert_eq!(a.url.as_deref(), Some("https://a.example/x"));
+    }
+
+    #[test]
+    fn ids_continuation_accepts_miniflux_string_form() {
+        // Miniflux serialises the continuation offset as a JSON string
+        // (`json:"continuation,omitempty,string"`); decoding it as a number
+        // used to fail the whole pull with "error decoding response body".
+        let page: IdList = serde_json::from_str(
+            r#"{"itemRefs":[{"id":"1"},{"id":"2"}],"continuation":"1000"}"#,
+        )
+        .unwrap();
+        assert_eq!(page.continuation, Some(1000));
+        assert_eq!(page.item_refs.len(), 2);
+    }
+
+    #[test]
+    fn ids_continuation_accepts_numeric_form_and_missing() {
+        // Some servers emit a plain number; the end of the stream omits the
+        // field (or sends `0` / `null`).
+        let page: IdList =
+            serde_json::from_str(r#"{"itemRefs":[{"id":"1"}],"continuation":1000}"#).unwrap();
+        assert_eq!(page.continuation, Some(1000));
+
+        let end: IdList = serde_json::from_str(r#"{"itemRefs":[]}"#).unwrap();
+        assert_eq!(end.continuation, None);
+
+        let zero: IdList = serde_json::from_str(r#"{"itemRefs":[],"continuation":0}"#).unwrap();
+        assert_eq!(zero.continuation, Some(0));
+
+        let null: IdList = serde_json::from_str(r#"{"itemRefs":[],"continuation":null}"#).unwrap();
+        assert_eq!(null.continuation, None);
     }
 }

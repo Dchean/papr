@@ -2548,12 +2548,27 @@ pub fn take_sync_queue(conn: &Connection) -> AppResult<Vec<SyncEntry>> {
         })?
         .collect::<Result<_, _>>()?;
     drop(stmt);
-    conn.execute(
-        "DELETE FROM sync_queue WHERE article_id IN
-            (SELECT id FROM articles WHERE remote_id IS NOT NULL)",
-        [],
-    )?;
+    // Delete exactly the drained rows. A naively broad sweep
+    // (`WHERE article_id IN (SELECT id FROM articles WHERE remote_id IS NOT
+    // NULL)`) also removes queue rows enqueued *mid-sync* — e.g. an edit made
+    // while the pull runs — wiping a change that was never pushed.
+    let tx = conn.unchecked_transaction()?;
+    for entry in &rows {
+        tx.execute(
+            "DELETE FROM sync_queue WHERE article_id = ?1 AND field = ?2 AND value = ?3",
+            params![entry.article_id, entry.field, entry.value],
+        )?;
+    }
+    tx.commit()?;
     Ok(rows)
+}
+
+/// True when `article_id` still carries an un-pushed local change. The pull
+/// consults this before writing server state over a change that hasn't been
+/// sent yet (e.g. one queued before the article had a `remote_id`).
+pub fn article_has_pending_sync(conn: &Connection, article_id: i64) -> AppResult<bool> {
+    let mut stmt = conn.prepare("SELECT 1 FROM sync_queue WHERE article_id = ?1 LIMIT 1")?;
+    Ok(stmt.exists(params![article_id])?)
 }
 
 /// Re-insert a queue entry whose push failed. Unlike `enqueue_sync` this does
@@ -3521,6 +3536,53 @@ mod tests {
     }
 
     // ── sync state reconciliation (issue #96) ────────────────────────
+
+    #[test]
+    fn take_sync_queue_deletes_only_the_drained_rows() {
+        // Regression: the old drain used a broad DELETE
+        // (`article_id IN (SELECT id FROM articles WHERE remote_id IS NOT
+        // NULL)`) so a change enqueued *mid-sync* — after take_sync_queue
+        // selected but before it deleted — was wiped before it could ever be
+        // pushed.
+        let (conn, aid) = test_db();
+        set_remote_id(&conn, aid, "tag:google.com,2005:reader/item/1").unwrap();
+        enqueue_sync(&conn, aid, "read", true).unwrap();
+        enqueue_sync(&conn, aid, "starred", true).unwrap();
+
+        // Simulate an edit landing after the SELECT but before the DELETE.
+        let drained = take_sync_queue(&conn).unwrap();
+        assert_eq!(drained.len(), 2);
+        enqueue_sync(&conn, aid, "starred", false).unwrap();
+
+        let remaining: Vec<(String, i64)> = conn
+            .prepare("SELECT field, value FROM sync_queue ORDER BY field")
+            .unwrap()
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            remaining,
+            vec![("starred".to_string(), 0)],
+            "the mid-sync edit must survive the drain"
+        );
+        let qlen: i64 = conn
+            .query_row("SELECT count(*) FROM sync_queue", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(qlen, 1);
+    }
+
+    #[test]
+    fn article_has_pending_sync_reflects_queued_changes() {
+        let (conn, aid) = test_db();
+        assert!(!article_has_pending_sync(&conn, aid).unwrap());
+        enqueue_sync(&conn, aid, "starred", true).unwrap();
+        assert!(article_has_pending_sync(&conn, aid).unwrap());
+        // Once pushed, the drain clears it.
+        set_remote_id(&conn, aid, "tag:google.com,2005:reader/item/1").unwrap();
+        take_sync_queue(&conn).unwrap();
+        assert!(!article_has_pending_sync(&conn, aid).unwrap());
+    }
 
     #[test]
     fn reconcile_marks_tail_read_and_scopes_to_server_feeds() {

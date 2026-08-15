@@ -65,3 +65,40 @@
 - Miniflux 全列表上限 10000：超过后旧条目不会被拉取对齐（仍保留本地状态）。
 - 本地在 Miniflux 中不存在（如尚未刷新）的文章不会被推送到服务器，直到本地刷新入库。
 - 文件夹同步依赖 API Key；未填时日志警告并跳过空文件夹操作。
+
+## 八、第二轮修复（实测反馈：收藏仍不同步 + 双向对齐失效 + 「error decoding response body」）
+
+### 8.1 根因 A：Miniflux 的 continuation 以 JSON 字符串序列化（拉取整体崩溃）
+
+- 现象：点击同步报「网络错误：error decoding response body」；收藏（starred）与已读状态一概无法同步。
+- 源码证据：`miniflux-src/internal/googlereader/response.go:62-65`
+
+  ```go
+  type streamIDResponse struct {
+      ItemRefs     []itemRef `json:"itemRefs"`
+      Continuation int       `json:"continuation,omitempty,string"`
+  }
+  ```
+
+  Go 的 `,string` 标签使 `continuation` 序列化为 **JSON 字符串**（如 `"1000"`），而旧 `sync.rs` 的 `IdList.continuation` 是 `usize`。`serde` 用数字类型解码字符串 → `error decoding response body` → 整个 `stream/items/ids` 拉取在**第一页**就失败（只要 reading-list > 1000 条，`continuation` 非 0）。之后收藏/已读状态自然全部拿不到。
+- 修复：`IdList.continuation` 改为 `Option<usize>` + 自定义反序列化器 `de_continuation`，同时接受 JSON 字符串（Miniflux）、数字、`null`、缺失字段；分页循环以「偏移严格递增」防死循环。
+
+### 8.2 根因 B：pull 无条件清空同步队列 → 本地星标/已读改动静默丢失（双向对齐失效）
+
+- 现象：在 papr 里点星标/标记已读后，Miniflux 上不出现对应状态。
+- 源码证据：`sync.rs`（旧）在 pull 应用服务器状态后无条件 `clear_sync_queue_for_article`。
+- 机制：`take_sync_queue` 只把**已经有 `remote_id`** 的队列条目取出推送；首次同步前本地改动的文章没有 `remote_id`，条目留在队列里。随后 pull 匹配到该文章 → 直接 `set_sync_state`（服务器状态覆盖本地改动）并 `clear_sync_queue_for_article`（清掉队列）→ 本地改动既没推送成，又被服务器状态覆盖，两条路都丢。
+- 修复（`sync.rs` + `db.rs`）：
+  1. pull 应用服务器状态前先查 `article_has_pending_sync`，有未推送改动的文章**跳过覆盖与清队**（仅持久化 `remote_id`）。
+  2. pull 之后新增**第二遍推送** `push_queue("after pull")`：被跳过的改动此时已有 `remote_id`，立即推给服务器，同一次同步内到达。
+  3. `take_sync_queue` 的删除改为**只删实际取出的行**（事务内逐条匹配 `article_id + field + value`）；旧实现用宽泛的 `article_id IN (SELECT id FROM articles WHERE remote_id IS NOT NULL)`，会把拉取期间新入队的改动一并抹掉。
+
+### 8.3 新增/调整的测试
+
+- `sync.rs`：`ids_continuation_accepts_miniflux_string_form`（字符串 `"1000"`）、`ids_continuation_accepts_numeric_form_and_missing`（数字 / 缺失 / `0` / `null`）。
+- `db.rs`：`take_sync_queue_deletes_only_the_drained_rows`（回归：拉取期间新入队条目必须存活）、`article_has_pending_sync_reflects_queued_changes`。
+
+### 8.4 验证
+
+- 本机仍无 Rust 工具链，改动为逐函数静态自查 + 上述新增回归测试；请在装有 Rust 的机器上运行：
+  `cargo test -p papr-core`
