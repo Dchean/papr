@@ -399,6 +399,7 @@
       "passPlaceholder": "Password / API password",
       "appPassPlaceholder": "Application password",
       "minifluxPassHint": "Miniflux requires an application password — create one under Settings → API Keys in your Miniflux account.",
+      "minifluxApiKeyPlaceholder": "API key (optional — for syncing folders)",
       "connecting": "Connecting…",
       "connect": "Connect",
       "otherServices": "Other services",

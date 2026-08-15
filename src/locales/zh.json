@@ -399,6 +399,7 @@
       "passPlaceholder": "密码 / API 密码",
       "appPassPlaceholder": "应用密码 (Application password)",
       "minifluxPassHint": "Miniflux 必须使用应用密码 —— 请在 Miniflux 账号的「设置 → API Keys」中生成一个。",
+      "minifluxApiKeyPlaceholder": "API 密钥（可选 —— 用于同步文件夹）",
       "connecting": "连接中…",
       "connect": "连接",
       "otherServices": "其它服务",

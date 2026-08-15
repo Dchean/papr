@@ -214,6 +214,10 @@ enum SyncCmd {
         password: String,
         #[arg(long, value_parser = ["freshrss", "miniflux"])]
         provider: Option<String>,
+        /// Miniflux API key — required for the native v1 category (folder)
+        /// endpoints that the GReader protocol cannot express.
+        #[arg(long)]
+        api_key: Option<String>,
     },
     /// Forget the stored sync credentials.
     Disconnect {
@@ -1058,10 +1062,24 @@ async fn cmd_sync(path: &Path, cmd: SyncCmd) -> Result<String, AxiError> {
             }
             Ok(d.into_toon())
         }
-        SyncCmd::Connect { url, user, password, provider } => {
-            sync::connect(&dbm, &client, &url, &user, &password, provider.as_deref())
-                .await
-                .map_err(|e| clean_err("sync connect failed", e))?;
+        SyncCmd::Connect {
+            url,
+            user,
+            password,
+            provider,
+            api_key,
+        } => {
+            sync::connect(
+                &dbm,
+                &client,
+                &url,
+                &user,
+                &password,
+                provider.as_deref(),
+                api_key.as_deref(),
+            )
+            .await
+            .map_err(|e| clean_err("sync connect failed", e))?;
             let mut d = Doc::new();
             d.set("ok", format!("connected to {url}"));
             d.help(vec!["Run `papr sync run` to reconcile now".into()]);

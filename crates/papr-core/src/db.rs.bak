@@ -743,43 +743,6 @@ pub fn delete_feed(conn: &Connection, id: i64) -> AppResult<()> {
     Ok(())
 }
 
-/// The feed URL for a feed id — used by the sync layer to propagate feed
-/// mutations (unsubscribe / move / URL change) to the server.
-pub fn feed_url(conn: &Connection, id: i64) -> AppResult<Option<String>> {
-    Ok(conn
-        .query_row(
-            "SELECT feed_url FROM feeds WHERE id = ?1",
-            params![id],
-            |r| r.get(0),
-        )
-        .optional()?)
-}
-
-/// The folder a feed sits in (by name, not id) — used by sync to propagate a
-/// local folder move server-side.
-pub fn feed_folder_name(conn: &Connection, id: i64) -> AppResult<Option<String>> {
-    Ok(conn
-        .query_row(
-            "SELECT fo.name
-             FROM feeds f LEFT JOIN folders fo ON fo.id = f.folder_id
-             WHERE f.id = ?1",
-            params![id],
-            |r| r.get::<_, Option<String>>(0),
-        )
-        .optional()?
-        .flatten())
-}
-
-/// The folder name for a folder id — used by sync to propagate folder
-/// create / rename / delete operations to the server.
-pub fn folder_name(conn: &Connection, id: i64) -> AppResult<Option<String>> {
-    Ok(conn
-        .query_row("SELECT name FROM folders WHERE id = ?1", params![id], |r| {
-            r.get(0)
-        })
-        .optional()?)
-}
-
 /// Feeds for OPML export as `(title, feed_url, folder)` tuples. Newsletter
 /// sources are excluded: OPML is an RSS-subscription interchange format, and a
 /// newsletter's `feed_url` is a synthetic `imap://user@host:port/folder`
@@ -799,17 +762,15 @@ pub fn feeds_for_export(conn: &Connection) -> AppResult<Vec<(String, String, Opt
     Ok(rows)
 }
 
-/// Feed URLs the sync layer should mirror onto the server, paired with the
-/// name of the folder each sits in (if any) so a newly pushed subscription can
-/// be filed into the same folder server-side. Excludes `newsletter` sources.
-pub fn feed_sync_targets(conn: &Connection) -> AppResult<Vec<(String, Option<String>)>> {
+/// Feed URLs the sync layer should mirror onto the server. Excludes
+/// `newsletter` sources (those have no upstream feed URL the server could
+/// subscribe to), matching the OPML-export filter.
+pub fn feed_urls_for_sync(conn: &Connection) -> AppResult<Vec<String>> {
     let mut stmt = conn.prepare(
-        "SELECT f.feed_url, fo.name
-         FROM feeds f LEFT JOIN folders fo ON fo.id = f.folder_id
-         WHERE f.source_type != 'newsletter' AND f.feed_url <> ''",
+        "SELECT feed_url FROM feeds WHERE source_type != 'newsletter' AND feed_url <> ''",
     )?;
     let rows = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .query_map([], |r| r.get(0))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -2359,37 +2320,6 @@ pub fn article_id_by_url(conn: &Connection, url: &str) -> AppResult<Option<i64>>
         .optional()?)
 }
 
-/// Local article id for a remote (GReader) item id. Miniflux's ids are a
-/// stable `tag:google.com,2005:reader/item/<hex>` form, so a pull can map a
-/// remote item straight onto its local row without relying on URL equality
-/// (which breaks when the server's canonical href differs from the feed
-/// document's own link).
-pub fn article_id_by_remote_id(conn: &Connection, remote_id: &str) -> AppResult<Option<i64>> {
-    Ok(conn
-        .query_row(
-            "SELECT id FROM articles WHERE remote_id = ?1 LIMIT 1",
-            params![remote_id],
-            |r| r.get(0),
-        )
-        .optional()?)
-}
-
-/// Local article id for a feed-scoped GUID — the pair `upsert_article` keys
-/// on, so a just-imported remote item can be found again.
-pub fn article_id_by_feed_guid(
-    conn: &Connection,
-    feed_id: i64,
-    guid: &str,
-) -> AppResult<Option<i64>> {
-    Ok(conn
-        .query_row(
-            "SELECT id FROM articles WHERE feed_id = ?1 AND guid = ?2 LIMIT 1",
-            params![feed_id, guid],
-            |r| r.get(0),
-        )
-        .optional()?)
-}
-
 pub fn set_remote_id(conn: &Connection, article_id: i64, remote_id: &str) -> AppResult<()> {
     conn.execute(
         "UPDATE articles SET remote_id = ?2 WHERE id = ?1",
@@ -2408,16 +2338,6 @@ pub fn set_sync_state(
     conn.execute(
         "UPDATE articles SET is_read = ?2, is_starred = ?3 WHERE id = ?1",
         params![article_id, read, starred],
-    )?;
-    Ok(())
-}
-
-/// Drop queued local state for an article once the remote server has been
-/// accepted as the source of truth.
-pub fn clear_sync_queue_for_article(conn: &Connection, article_id: i64) -> AppResult<()> {
-    conn.execute(
-        "DELETE FROM sync_queue WHERE article_id = ?1",
-        params![article_id],
     )?;
     Ok(())
 }

@@ -399,6 +399,7 @@
       "passPlaceholder": "パスワード / API パスワード",
       "appPassPlaceholder": "アプリケーションパスワード",
       "minifluxPassHint": "Miniflux ではアプリケーションパスワードが必要です。Miniflux の「設定 → API Keys」で発行してください。",
+      "minifluxApiKeyPlaceholder": "API キー（任意 — フォルダ同期用）",
       "connecting": "接続中…",
       "connect": "接続",
       "otherServices": "その他のサービス",

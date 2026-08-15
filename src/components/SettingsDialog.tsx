@@ -1042,6 +1042,7 @@ function SyncSection({ onToast }: { onToast: (m: string) => void }) {
   const [url, setUrl] = useState("");
   const [user, setUser] = useState("");
   const [pass, setPass] = useState("");
+  const [apiKey, setApiKey] = useState("");
   const [busy, setBusy] = useState(false);
   const connected = status.data?.connected ?? false;
   const connectedProvider: api.GReaderProvider =
@@ -1053,7 +1054,13 @@ function SyncSection({ onToast }: { onToast: (m: string) => void }) {
     if (!url.trim() || !user.trim()) return;
     setBusy(true);
     try {
-      await api.freshrssConnect(url.trim(), user.trim(), pass, provider);
+      await api.freshrssConnect(
+        url.trim(),
+        user.trim(),
+        pass,
+        provider,
+        provider === "miniflux" ? apiKey.trim() : undefined,
+      );
       await qc.invalidateQueries({ queryKey: ["freshrss-status"] });
       onToast(t("settings.sync.connected"));
       setPass("");
@@ -1196,16 +1203,27 @@ function SyncSection({ onToast }: { onToast: (m: string) => void }) {
                 onChange={(e) => setPass(e.target.value)}
               />
               {provider === "miniflux" && (
-                <p
-                  style={{
-                    fontSize: 12,
-                    color: "var(--muted)",
-                    margin: "2px 0 0",
-                    lineHeight: 1.5,
-                  }}
-                >
-                  {t("settings.sync.minifluxPassHint")}
-                </p>
+                <>
+                  <input
+                    className="modal-input"
+                    style={{ margin: 0 }}
+                    type="password"
+                    placeholder={t("settings.sync.minifluxApiKeyPlaceholder")}
+                    {...NO_AUTOCORRECT}
+                    value={apiKey}
+                    onChange={(e) => setApiKey(e.target.value)}
+                  />
+                  <p
+                    style={{
+                      fontSize: 12,
+                      color: "var(--muted)",
+                      margin: "2px 0 0",
+                      lineHeight: 1.5,
+                    }}
+                  >
+                    {t("settings.sync.minifluxPassHint")}
+                  </p>
+                </>
               )}
               <div>
                 <button

@@ -41,20 +41,52 @@ pub async fn list_folders(state: State<'_, AppState>) -> AppResult<Vec<Folder>> 
 
 #[tauri::command]
 pub async fn create_folder(state: State<'_, AppState>, name: String) -> AppResult<i64> {
-    let conn = state.db.lock().await;
-    db::create_folder(&conn, &name)
+    let id = {
+        let conn = state.db.lock().await;
+        db::create_folder(&conn, &name)?
+    };
+    // Propagate the new folder to the sync server so an empty Miniflux
+    // category appears server-side too (GReader labels only exist on
+    // subscriptions, so this needs Miniflux's native API when connected).
+    match crate::sync::create_remote_folder(&state.db, &state.http(), &name).await {
+        Ok(_) => {}
+        Err(e) => log::warn!("failed to propagate folder create to sync server: {e}"),
+    }
+    Ok(id)
 }
 
 #[tauri::command]
 pub async fn rename_folder(state: State<'_, AppState>, id: i64, name: String) -> AppResult<()> {
-    let conn = state.db.lock().await;
-    db::rename_folder(&conn, id, &name)
+    let old_name = {
+        let conn = state.db.lock().await;
+        let old_name = db::folder_name(&conn, id)?;
+        db::rename_folder(&conn, id, &name)?;
+        old_name
+    };
+    if let Some(old_name) = old_name {
+        match crate::sync::rename_remote_folder(&state.db, &state.http(), &old_name, &name).await {
+            Ok(_) => {}
+            Err(e) => log::warn!("failed to propagate folder rename to sync server: {e}"),
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn delete_folder(state: State<'_, AppState>, id: i64) -> AppResult<()> {
-    let conn = state.db.lock().await;
-    db::delete_folder(&conn, id)
+    let old_name = {
+        let conn = state.db.lock().await;
+        let old_name = db::folder_name(&conn, id)?;
+        db::delete_folder(&conn, id)?;
+        old_name
+    };
+    if let Some(old_name) = old_name {
+        match crate::sync::delete_remote_folder(&state.db, &state.http(), &old_name).await {
+            Ok(_) => {}
+            Err(e) => log::warn!("failed to propagate folder delete to sync server: {e}"),
+        }
+    }
+    Ok(())
 }
 
 // ─────────────────────────── feeds ───────────────────────────
@@ -265,8 +297,20 @@ pub async fn search_feed_directory(
 
 #[tauri::command]
 pub async fn delete_feed(state: State<'_, AppState>, id: i64) -> AppResult<()> {
-    let conn = state.db.lock().await;
-    db::delete_feed(&conn, id)
+    let old_url = {
+        let conn = state.db.lock().await;
+        let old_url = db::feed_url(&conn, id)?;
+        db::delete_feed(&conn, id)?;
+        old_url
+    };
+    log::info!("feed unsubscribed locally: #{id} {:?}", old_url);
+    if let Some(url) = old_url {
+        match crate::sync::unsubscribe_subscription_url(&state.db, &state.http(), &url).await {
+            Ok(_) => {}
+            Err(e) => log::warn!("failed to propagate unsubscribe to sync server: {e}"),
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -275,8 +319,25 @@ pub async fn move_feed(
     id: i64,
     folder_id: Option<i64>,
 ) -> AppResult<()> {
-    let conn = state.db.lock().await;
-    db::move_feed(&conn, id, folder_id)
+    let (url, folder) = {
+        let conn = state.db.lock().await;
+        db::move_feed(&conn, id, folder_id)?;
+        (db::feed_url(&conn, id)?, db::feed_folder_name(&conn, id)?)
+    };
+    if let Some(url) = url {
+        match crate::sync::set_subscription_folder_url(
+            &state.db,
+            &state.http(),
+            &url,
+            folder.as_deref(),
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(e) => log::warn!("failed to propagate feed folder update to sync server: {e}"),
+        }
+    }
+    Ok(())
 }
 
 /// Set a feed's per-feed refresh interval. `None` reverts it to the global
@@ -1173,10 +1234,19 @@ pub async fn freshrss_connect(
     username: String,
     password: String,
     provider: Option<String>,
+    api_key: Option<String>,
 ) -> AppResult<()> {
     let state = app.state::<AppState>();
-    crate::sync::connect(&state.db, &state.http(), &url, &username, &password, provider.as_deref())
-        .await
+    crate::sync::connect(
+        &state.db,
+        &state.http(),
+        &url,
+        &username,
+        &password,
+        provider.as_deref(),
+        api_key.as_deref(),
+    )
+    .await
 }
 
 #[tauri::command]

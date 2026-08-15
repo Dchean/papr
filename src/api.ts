@@ -227,7 +227,15 @@ export const freshrssConnect = (
   username: string,
   password: string,
   provider: GReaderProvider = "freshrss",
-) => invoke<void>("freshrss_connect", { url, username, password, provider });
+  apiKey?: string,
+) =>
+  invoke<void>("freshrss_connect", {
+    url,
+    username,
+    password,
+    provider,
+    apiKey,
+  });
 export const freshrssDisconnect = () => invoke<void>("freshrss_disconnect");
 export const freshrssSync = () => invoke<number>("freshrss_sync");
 
