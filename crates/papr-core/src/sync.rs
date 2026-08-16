@@ -1200,8 +1200,8 @@ async fn server_state_sets(
     http: &Client,
     provider: Provider,
 ) -> AppResult<(std::collections::HashSet<String>, std::collections::HashSet<String>)> {
-    let unread_urls;
-    let starred_urls;
+    let unread_urls: HashSet<String>;
+    let starred_urls: HashSet<String>;
     if matches!(provider, Provider::Miniflux) {
         let unread_ids = fetch_item_ids(session, http, READING_LIST, Some(READ_TAG)).await?;
         let starred_ids = fetch_item_ids(session, http, STARRED_TAG, None).await?;
