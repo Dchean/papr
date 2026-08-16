@@ -794,6 +794,25 @@ fn translate_target_lang(conn: &rusqlite::Connection) -> String {
         .unwrap_or_else(|| "en".to_string())
 }
 
+/// Fetch the model names an OpenAI-compatible provider (OpenAI, DeepSeek, or a
+/// custom base-URL server) advertises via its `GET /models` endpoint, so the
+/// settings UI can offer a dropdown instead of requiring the model name to be
+/// typed by hand. `provider` is the raw setting value (`anthropic` / `openai` /
+/// `deepseek`); `base_url` / `api_key` are the current values the UI is about to
+/// save, so a just-tweaked endpoint is what gets queried. Anthropic has no
+/// public model-listing endpoint and returns an empty list — the UI keeps its
+/// manual text field there.
+#[tauri::command]
+pub async fn ai_list_models(
+    state: State<'_, AppState>,
+    provider: String,
+    base_url: String,
+    api_key: String,
+) -> AppResult<Vec<String>> {
+    let http = state.http();
+    ai::list_models(&http, &base_url, &api_key, &provider).await
+}
+
 /// Stream an AI summary of one article; the full summary is also persisted.
 #[tauri::command]
 pub async fn ai_summarize(
@@ -1177,6 +1196,15 @@ pub async fn cleanup_articles(app: AppHandle, days: i64) -> AppResult<usize> {
 pub async fn vacuum_db(state: State<'_, AppState>) -> AppResult<()> {
     let conn = state.db.lock().await;
     db::vacuum(&conn)
+}
+
+/// Remove duplicate local articles (same Miniflux item or same URL within a
+/// feed), keeping the row with a remote id / fullest content. Returns the
+/// number of duplicate rows deleted.
+#[tauri::command]
+pub async fn deduplicate_articles(state: State<'_, AppState>) -> AppResult<usize> {
+    let conn = state.db.lock().await;
+    db::deduplicate_articles(&conn)
 }
 
 /// Clear every stored setting (AI keys, sync credentials, preferences).

@@ -1434,6 +1434,22 @@ function StorageGroup({ onToast }: { onToast: (m: string) => void }) {
       setBusy(false);
     }
   };
+  const dedup = async () => {
+    setBusy(true);
+    try {
+      const n = await api.deduplicateArticles();
+      await qc.invalidateQueries();
+      onToast(
+        n > 0
+          ? t("settings.advanced.dedupArticlesDone", { count: n })
+          : t("settings.advanced.dedupArticlesNone"),
+      );
+    } catch (e) {
+      reportError(e);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const s = stats.data;
   return (
@@ -1484,6 +1500,14 @@ function StorageGroup({ onToast }: { onToast: (m: string) => void }) {
       >
         <button className="s-btn" onClick={vacuum} disabled={busy}>
           {t("settings.advanced.compress")}
+        </button>
+      </Row>
+      <Row
+        label={t("settings.advanced.dedupArticles")}
+        desc={t("settings.advanced.dedupArticlesDesc")}
+      >
+        <button className="s-btn" onClick={dedup} disabled={busy}>
+          {t("settings.advanced.dedupArticles")}
         </button>
       </Row>
     </div>
@@ -1701,6 +1725,46 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
   const savedModel = useRef("");
   const savedBaseUrl = useRef("");
 
+  // Auto-fetched model list for OpenAI-compatible providers, plus fetch state.
+  // `modelsNonce` is bumped (provider change, base-url/key blur, manual refresh)
+  // to re-trigger the fetch; `modelsRev` guards against applying a stale response.
+  const [models, setModels] = useState<string[]>([]);
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [modelsError, setModelsError] = useState(false);
+  const [modelsNonce, setModelsNonce] = useState(0);
+  const modelsRev = useRef(0);
+
+  useEffect(() => {
+    // Only OpenAI-compatible providers expose a public model-listing endpoint.
+    if (provider !== "openai" && provider !== "deepseek") {
+      setModels([]);
+      setModelsError(false);
+      return;
+    }
+    const rev = ++modelsRev.current;
+    setModelsLoading(true);
+    setModelsError(false);
+    const b = baseUrl.trim();
+    const effective =
+      b || (provider === "openai" ? "https://api.openai.com/v1" : "https://api.deepseek.com");
+    const key = apiKey.trim() || savedKey.current;
+    api
+      .listAiModels(provider, effective, key)
+      .then((list) => {
+        if (rev !== modelsRev.current) return; // a newer fetch superseded this one
+        setModels(list);
+        setModelsLoading(false);
+      })
+      .catch(() => {
+        if (rev !== modelsRev.current) return;
+        setModelsError(true);
+        setModelsLoading(false);
+      });
+    // The effect reads the latest baseUrl/apiKey at call time but must not
+    // re-run on every keystroke — only on provider or explicit nonce changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [provider, modelsNonce]);
+
   useEffect(() => {
     Promise.all([
       api.getSetting("ai_provider"),
@@ -1811,6 +1875,9 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
             if (trimmed !== savedKey.current) {
               savedKey.current = trimmed;
               save("ai_api_key", trimmed, t("settings.advanced.aiApiKeyLabel"));
+              // A new key may unlock a model list the previous key lacked —
+              // refresh the dropdown against the latest persisted credentials.
+              setModelsNonce((n) => n + 1);
             }
           }}
         />
@@ -1819,25 +1886,83 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
         label={t("settings.advanced.aiModel")}
         desc={t("settings.advanced.aiModelDesc")}
       >
-        <input
-          className="s-text-input"
-          type="text"
-          {...NO_AUTOCORRECT}
-          value={model}
-          placeholder={placeholder}
-          onChange={(e) => setModel(e.target.value)}
-          onBlur={() => {
-            // Trim before persisting — a pasted model name with a stray
-            // space / newline yields a "model not found" from the provider.
-            const trimmed = model.trim();
-            if (trimmed !== model) setModel(trimmed);
-            if (trimmed !== savedModel.current) {
-              savedModel.current = trimmed;
-              save("ai_model", trimmed, t("settings.advanced.aiModelLabel"));
-            }
-          }}
-        />
+        {provider !== "anthropic" && !modelsError ? (
+          <>
+            {/* Anthropic has no public model-listing endpoint, and a failed
+                fetch falls back to the manual input so the user can still type
+                any model. OpenAI-compatible providers let us list the models
+                and pick one — much safer than hand-typing a name the provider
+                will reject. */}
+            <div
+              className="ai-model-row"
+              style={{ display: "flex", gap: "0.5rem", width: "100%" }}
+            >
+              <Select<string>
+                value={model}
+                aria-label={t("settings.advanced.aiModelLabel")}
+                options={[
+                  ...models.map((m) => ({ value: m, label: m })),
+                  // Keep the persisted model selectable even when the fetched
+                  // list omits it (custom / freshly-acquired model names).
+                  ...(model && !models.includes(model)
+                    ? [{ value: model, label: model }]
+                    : []),
+                ]}
+                onChange={(v) => {
+                  setModel(v);
+                  savedModel.current = v;
+                  save("ai_model", v, t("settings.advanced.aiModelLabel"));
+                }}
+              />
+              <button
+                className="s-btn"
+                type="button"
+                aria-label={t("settings.advanced.aiModelRefresh")}
+                disabled={modelsLoading}
+                onClick={() => setModelsNonce((n) => n + 1)}
+              >
+                {modelsLoading
+                  ? t("settings.advanced.aiModelLoading")
+                  : t("settings.advanced.aiModelRefresh")}
+              </button>
+            </div>
+            {modelsLoading && (
+              <div className="settings-row-desc">
+                {t("settings.advanced.aiModelFetching")}
+              </div>
+            )}
+            {!modelsLoading && models.length === 0 && (
+              <div className="settings-row-desc">
+                {t("settings.advanced.aiModelNoModels")}
+              </div>
+            )}
+          </>
+        ) : (
+          <input
+            className="s-text-input"
+            type="text"
+            {...NO_AUTOCORRECT}
+            value={model}
+            placeholder={placeholder}
+            onChange={(e) => setModel(e.target.value)}
+            onBlur={() => {
+              // Trim before persisting — a pasted model name with a stray
+              // space / newline yields a "model not found" from the provider.
+              const trimmed = model.trim();
+              if (trimmed !== model) setModel(trimmed);
+              if (trimmed !== savedModel.current) {
+                savedModel.current = trimmed;
+                save("ai_model", trimmed, t("settings.advanced.aiModelLabel"));
+              }
+            }}
+          />
+        )}
       </Row>
+      {provider !== "anthropic" && modelsError && (
+        <div className="settings-row-desc">
+          {t("settings.advanced.aiModelFetchFailed")}
+        </div>
+      )}
       <Row
         label={t("settings.advanced.aiBaseUrl")}
         desc={t("settings.advanced.aiBaseUrlDesc")}
@@ -1855,6 +1980,9 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
             if (trimmed !== savedBaseUrl.current) {
               savedBaseUrl.current = trimmed;
               save("ai_base_url", trimmed, t("settings.advanced.aiBaseUrlLabel"));
+              // The model list depends on which endpoint we query — refresh it
+              // against the new base URL.
+              setModelsNonce((n) => n + 1);
             }
           }}
         />

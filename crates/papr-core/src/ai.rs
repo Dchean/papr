@@ -197,6 +197,43 @@ pub async fn stream_chat(
     }
 }
 
+/// Fetch the model names a provider advertises via its OpenAI-compatible
+/// `GET {base_url}/models` endpoint (OpenAI, DeepSeek, and any custom
+/// base-URL server). Returns an empty list for Anthropic, which has no public
+/// model-listing endpoint — the UI keeps manual entry there. Auth / network
+/// failures surface as an error so the UI can tell "unsupported" from "the
+/// endpoint refused us".
+pub async fn list_models(
+    client: &Client,
+    base_url: &str,
+    api_key: &str,
+    provider: &str,
+) -> AppResult<Vec<String>> {
+    if matches!(provider, "anthropic") {
+        return Ok(Vec::new());
+    }
+    let resp = client
+        .get(format!("{}/models", base_url.trim_end_matches('/')))
+        .bearer_auth(api_key)
+        .timeout(AI_REQUEST_TIMEOUT)
+        .send()
+        .await?;
+    let resp = ensure_success(resp, "AI models").await?;
+    let value: Value = resp.json().await?;
+    let mut models: Vec<String> = value["data"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m["id"].as_str().map(str::to_string))
+                .filter(|m| !m.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    models.sort();
+    models.dedup();
+    Ok(models)
+}
+
 /// Run a completion to the end and return its full text WITHOUT forwarding
 /// per-token deltas anywhere. Translation and the agent CLI use this when they
 /// only want the final string.

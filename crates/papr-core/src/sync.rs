@@ -366,11 +366,24 @@ struct Href {
 /// historically carried the canonical link in `alternate`, so try
 /// `canonical` first then `alternate`.
 fn item_url(item: &Item) -> Option<String> {
+    item_urls(item).into_iter().next()
+}
+
+/// Every distinct candidate URL for a remote item, in match priority order:
+/// all `canonical[].href`, then all `alternate[].href`. A feed document often
+/// carries the entry link only in `alternate` while Miniflux re-emits it as
+/// `canonical` — matching on just the first one lets a re-sync insert a second
+/// row for the same post. Capturing the whole set lets the caller find an
+/// existing article by any of its links, so imports stay idempotent.
+fn item_urls(item: &Item) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
     item.canonical
-        .first()
-        .or_else(|| item.alternate.first())
+        .iter()
+        .chain(item.alternate.iter())
         .map(|h| h.href.trim().to_string())
         .filter(|u| !u.is_empty())
+        .filter(|u| seen.insert(u.clone()))
+        .collect()
 }
 
 /// Build a local `NewArticle` from a remote item, so a server-side article
@@ -1172,6 +1185,44 @@ async fn pull_remote_items(
     }
 }
 
+/// The server's authoritative unread and starred URL sets, used to reconcile
+/// the long tail: items a pull of only the recent reading-list window never
+/// enumerates (Miniflux caps it at ~10k items) would otherwise keep a stale
+/// *local unread* state, drifting the local unread count above the server's.
+///
+/// For Miniflux the reading-list is Window-capped but the per-state stream
+/// (unread / starred) is the bounded set a GReader client treats as truth, so
+/// fetching those two id sets (then their URLs) is how we capture "everything
+/// the server considers unread / starred". For FreshRSS the same two bounded
+/// `fetch_stream_items` sets are used directly.
+async fn server_state_sets(
+    session: &Session,
+    http: &Client,
+    provider: Provider,
+) -> AppResult<(std::collections::HashSet<String>, std::collections::HashSet<String>)> {
+    let unread_urls;
+    let starred_urls;
+    if matches!(provider, Provider::Miniflux) {
+        let unread_ids = fetch_item_ids(session, http, READING_LIST, Some(READ_TAG)).await?;
+        let starred_ids = fetch_item_ids(session, http, STARRED_TAG, None).await?;
+        let unread = fetch_items_by_id(session, http, &unread_ids).await?;
+        let starred = fetch_items_by_id(session, http, &starred_ids).await?;
+        unread_urls = unread.iter().filter_map(item_url).collect();
+        starred_urls = starred.iter().filter_map(item_url).collect();
+    } else {
+        let unread = fetch_stream_items(session, http, READING_LIST, Some(READ_TAG)).await?;
+        let starred = fetch_stream_items(session, http, STARRED_TAG, None).await?;
+        unread_urls = unread.iter().filter_map(item_url).collect();
+        starred_urls = starred.iter().filter_map(item_url).collect();
+    }
+    log::info!(
+        "sync: server state sets: unread_urls={} starred_urls={}",
+        unread_urls.len(),
+        starred_urls.len()
+    );
+    Ok((unread_urls, starred_urls))
+}
+
 /// Push queued changes, then pull subscriptions, remote articles, and
 /// read/starred state. Returns how many articles the server's state was
 /// applied to (the "aligned" count surfaced by the UI and the CLI's
@@ -1306,7 +1357,11 @@ pub async fn sync_now(db: &Db, http: &Client) -> AppResult<usize> {
         // per-item table scan; built lazily on first miss instead of eagerly
         // (the common case is a small unread set).
         for item in items {
-            let url = item_url(&item);
+            let urls = item_urls(&item);
+            // The first candidate stays the "face" URL for new imports; the
+            // rest are lookup-only so a canonical/alternate mismatch between
+            // the feed document and Miniflux can't create a duplicate row.
+            let url = urls.first().cloned();
             let read = has_state_tag(&item.categories, READ_TAG);
             let starred = has_state_tag(&item.categories, STARRED_TAG);
             let feed_id = item
@@ -1314,11 +1369,13 @@ pub async fn sync_now(db: &Db, http: &Client) -> AppResult<usize> {
                 .as_ref()
                 .and_then(|o| remote_feed_ids.get(&o.stream_id))
                 .copied();
-            let mut aid = if let Some(url) = url.as_deref() {
-                db::article_id_by_url(&conn, url)?
-            } else {
-                None
-            };
+            let mut aid = None;
+            for candidate in &urls {
+                if let Some(existing) = db::article_id_by_url(&conn, candidate)? {
+                    aid = Some(existing);
+                    break;
+                }
+            }
             // Miniflux's item id is stable — prefer the remote-id mapping when
             // the URL lookup missed (URL normalisation differences between the
             // feed document and Miniflux's canonical href).
@@ -1371,6 +1428,27 @@ pub async fn sync_now(db: &Db, http: &Client) -> AppResult<usize> {
             db::clear_sync_queue_for_article(&conn, aid)?;
             reconciled += 1;
         }
+    }
+
+    // 3a ── reconcile the long tail. The item loop above only aligns items the
+    // server puts in the reading-list window; anything older (Miniflux caps it
+    // at ~10k items) keeps a stale local unread state. Sweep every article in a
+    // server-known feed against the server's authoritative unread/starred URL
+    // sets: items the server considers read are marked read locally, so the
+    // local unread count converges on the server's. `reconcile_sync_state`
+    // skips articles with an un-pushed local edit, so a two-way edit already
+    // queued is never clobbered (same principle as the per-item loop above).
+    match server_state_sets(&session, http, creds.provider).await {
+        Ok((unread_urls, starred_urls)) => {
+            let reconciled_tail = {
+                let conn = db.lock().await;
+                let server_feed_ids = db::feed_ids_by_urls(&conn, &server_urls)?;
+                db::reconcile_sync_state(&conn, &server_feed_ids, &unread_urls, &starred_urls)?
+            };
+            reconciled += reconciled_tail;
+            log::info!("sync: reconciled long-tail articles={reconciled_tail}");
+        }
+        Err(e) => log::warn!("sync: long-tail reconcile skipped: {e}"),
     }
 
     // 3b ── second push pass: changes queued before the pull had no remote id

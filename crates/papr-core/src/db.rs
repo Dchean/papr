@@ -2494,7 +2494,91 @@ pub fn reconcile_sync_state(
     Ok(changed.len())
 }
 
-/// Queue a local read/starred change to push on the next sync.
+/// Remove duplicate articles — two (or more) local rows that stand for one
+/// post. A feed refresh and a sync pull can each insert their own row when the
+/// URL the pull matches on differs from the one the feed parser stored, so the
+/// article list shows the same post twice while the server has it once.
+///
+/// Two passes, each in keeper-priority order (remote id first, then fullest
+/// content, then lowest id) so the best row of every group survives and the
+/// rest are deleted (child tables cascade):
+///
+/// 1. Rows sharing `(feed_id, remote_id)` — same Miniflux item, proven by the
+///    server. This catches the canonical-vs-feed-link mismatch even when the
+///    two rows carry different URLs.
+/// 2. Remaining rows sharing `(feed_id, url)` — same stored link.
+///
+/// Rows with an un-pushed local edit in `sync_queue` are never deleted, so a
+/// queued change is not silently dropped. Returns the number of rows deleted.
+pub fn deduplicate_articles(conn: &Connection) -> AppResult<usize> {
+    let pending: std::collections::HashSet<i64> =
+        pending_sync_article_ids(conn)?.into_iter().collect();
+    let tx = conn.unchecked_transaction()?;
+    let mut deleted = 0usize;
+
+    // Pass 1: duplicate remote ids.
+    let rows = tx
+        .prepare(
+            "SELECT id, feed_id, remote_id FROM articles
+             WHERE remote_id IS NOT NULL
+             ORDER BY feed_id, remote_id, length(content_html) DESC, id ASC",
+        )?
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut group: Option<(i64, String)> = None;
+    for (id, feed_id, remote_id) in rows {
+        let key = (feed_id, remote_id);
+        if group.as_ref() == Some(&key) {
+            if !pending.contains(&id) {
+                tx.execute("DELETE FROM articles WHERE id = ?1", params![id])?;
+                deleted += 1;
+            }
+        } else {
+            group = Some(key);
+        }
+    }
+
+    // Pass 2: duplicate URLs among the rows that survive pass 1.
+    let rows = tx
+        .prepare(
+            "SELECT id, feed_id, url, remote_id FROM articles
+             WHERE url IS NOT NULL AND length(url) > 0
+             ORDER BY feed_id, url,
+               CASE WHEN remote_id IS NOT NULL THEN 0 ELSE 1 END,
+               length(content_html) DESC,
+               id ASC",
+        )?
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut group: Option<(i64, String)> = None;
+    for (id, feed_id, url, _remote_id) in rows {
+        let key = (feed_id, url);
+        if group.as_ref() == Some(&key) {
+            if !pending.contains(&id) {
+                tx.execute("DELETE FROM articles WHERE id = ?1", params![id])?;
+                deleted += 1;
+            }
+        } else {
+            group = Some(key);
+        }
+    }
+
+    tx.commit()?;
+    Ok(deleted)
+}
 pub fn enqueue_sync(
     conn: &Connection,
     article_id: i64,

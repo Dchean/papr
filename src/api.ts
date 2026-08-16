@@ -171,6 +171,16 @@ export function aiDigest(onToken: (e: AiEvent) => void): Promise<void> {
   return invoke<void>("ai_digest", { onToken: channel });
 }
 
+/** Fetch the model names an OpenAI-compatible AI provider advertises at its
+ *  `GET /models` endpoint, for the settings model dropdown. Returns an empty
+ *  array for Anthropic (no public listing endpoint) or servers without a
+ *  `/models` route. */
+export const listAiModels = (
+  provider: string,
+  baseUrl: string,
+  apiKey: string,
+) => invoke<string[]>("ai_list_models", { provider, baseUrl, apiKey });
+
 /** Translate the article body into `lang` using `engine` (`llm` / `google` /
  *  `deepl` / `bing`). Progress is reported per batch over `onEvent` (start →
  *  batch* → done); the full result is also persisted and returned via the final
@@ -207,6 +217,8 @@ export const storageStats = () => invoke<StorageStats>("storage_stats");
 export const cleanupArticles = (days: number) =>
   invoke<number>("cleanup_articles", { days });
 export const vacuumDb = () => invoke<void>("vacuum_db");
+export const deduplicateArticles = () =>
+  invoke<number>("deduplicate_articles");
 export const resetSettings = () => invoke<void>("reset_settings");
 export const clearAllData = () => invoke<void>("clear_all_data");
 
